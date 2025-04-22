@@ -77,7 +77,7 @@ history = model.fit(
 )
 
 
-model.save('../models/model.keras')
+model.save('../models/my_model.keras')
 
 
 def update_class_names_file(class_names, file_path='../datasets/persons/class_names.txt'):

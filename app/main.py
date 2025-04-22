@@ -1,303 +1,133 @@
-import pandas as pd
+"""
+Ultra‑minimal PyQt5 demo that runs YOLOv5 object detection on either:
+  • a selected USB/web camera (choose ID from a dropdown)  
+  • an .mp4 / .avi / .mov / .mkv video file
+
+Optimisations:
+  * Loads the model once, moves it to GPU if available, and switches to half‑precision (FP16) on CUDA.
+  * Uses the built‑in `render()` method of Ultralytics YOLO for fastest NumPy → BGR annotation.
+  * Resizes inference input to 640 px on its longer side for speed (adjustable).
+  * Single‑threaded Qt timer loop (30 ms) keeps the GUI responsive without additional threads.
+  * No TTS, face‑rec, or config files – just pure detection + drawing.
+"""
+
 import sys
-import torch
 import cv2
-import time
-import random
-import pyttsx3
-from tensorflow.keras.models import load_model
-from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QLabel, QVBoxLayout, QWidget, QDialog
+import torch
+from PyQt5.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QLabel,
+    QPushButton,
+    QFileDialog,
+    QComboBox,
+    QVBoxLayout,
+    QWidget,
+)
 from PyQt5.QtGui import QPixmap, QImage
-from PyQt5.QtCore import QTimer, Qt
-import subprocess
-import json
-from PyQt5.QtWidgets import QTextEdit
+from PyQt5.QtCore import QTimer
 
+# --------------------  MODEL INIT  -------------------- #
+print("Loading YOLOv5 model…")
+_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+_MODEL = (
+    torch.hub.load("ultralytics/yolov5", "yolov5s", pretrained=True)
+    .to(_DEVICE)
+    .eval()
+)
+if _DEVICE == "cuda":
+    _MODEL.half()  # FP16 for extra speed
+print(f"Model loaded on {_DEVICE}")
 
-OBJECT_PRIORITIES = {
-    "knife": 1,            
-    "scissors": 2,         
-    "baseball bat": 3,     
-    "fork": 4,             
-    "baseball glove": 5,   
-    "tennis racket": 6,    
-    "car": 7,             
-    "motorcycle": 8,      
-    "truck": 9,            
-    "bus": 10,             
-    "train": 11,          
-    "bicycle": 12,         
-    "airplane": 13,        
-    "traffic light": 14,   
-    "stop sign": 15,       
-}
-
-
-model = torch.hub.load('ultralytics/yolov5', 'yolov5s')
-face_recognition_model = load_model('../models/my_model.keras')
-
-def load_class_names(file_path):
-    with open(file_path, 'r') as f:
-        return [line.strip() for line in f.readlines()]
-
-CLASS_NAMES = load_class_names('class_names.txt')
-
-
-engine = pyttsx3.init()
-engine.setProperty('rate', 150)
-engine.setProperty('volume', 1)
-
-FRAME_SKIP = 5
-COLORS = {}
-last_said = {}
-
-def load_settings():
-    try:
-        with open('settings.json', 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {"speak_greeting": True}
-
-def save_settings(settings):
-    with open('settings.json', 'w') as f:
-        json.dump(settings, f)
-
-def get_color(label):
-    if label not in COLORS:
-        COLORS[label] = [random.randint(0, 255) for _ in range(3)]
-    return COLORS[label]
-
-
-def sort_by_priority(labels):
-    
-    return sorted(labels, key=lambda label: OBJECT_PRIORITIES.get(label, float('inf')))
-
-
-def filter_objects(detected_objects):
-    return [row['name'] for index, row in detected_objects.iterrows() if row['confidence'] > 0.5]
-
-def speak_labels(labels):
-    global last_said
-    current_time = time.time()
-    
-   
-    sorted_labels = sort_by_priority(labels)
-    
-    to_speak = [label for label in sorted_labels if label not in last_said or current_time - last_said[label] > 2]
-
-    if to_speak:
-        description = "Objects detected: " + ", ".join(to_speak)
-        engine.say(description)
-        engine.runAndWait()
-        for label in to_speak:
-            last_said[label] = current_time
-
-def recognize_face(face):
-    # Validate face dimensions
-    if face is None or face.size == 0 or len(face.shape) != 3 or face.shape[2] != 3:
-        return "nameless"
-
-    try:
-        # Resize and preprocess the face
-        face = cv2.resize(face, (32, 32))  # Resize to 32x32 pixels
-        face = face / 255.0  # Normalize pixel values to [0, 1]
-        face = face.reshape(1, 32, 32, 3)  # Add batch dimension
-        predictions = face_recognition_model.predict(face)  # Model prediction
-        predicted_class = predictions.argmax(axis=-1)[0]
-        confidence = predictions.max()
-
-        return CLASS_NAMES[predicted_class] if confidence > 0.5 else "nameless"
-    except Exception as e:
-        print(f"Error in face recognition: {e}")
-        return "nameless"
-
-
-
-class SettingsDialog(QDialog):
+# --------------------  APP  --------------------------- #
+class DetectorGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Settings")
-        self.setGeometry(150, 150, 300, 200)
+        self.setWindowTitle("YOLOv5 Realtime Object Detection")
+        self.setGeometry(100, 100, 800, 650)
 
+        # Preview widget
+        self.preview = QLabel(alignment=0x84)  # Align center
+        self.preview.setFixedSize(640, 480)
+
+        # Camera selector (IDs 0‑5 are usually enough)
+        self.cam_box = QComboBox(); self.cam_box.addItems([str(i) for i in range(5)])
+
+        # Buttons
+        self.btn_start = QPushButton("Start Camera")
+        self.btn_video = QPushButton("Open Video…")
+        self.btn_stop  = QPushButton("Stop")
+
+        self.btn_start.clicked.connect(self.start_camera)
+        self.btn_video.clicked.connect(self.open_video)
+        self.btn_stop.clicked.connect(self.stop_stream);
+        self.btn_stop.setEnabled(False)
+
+        # Layout
         layout = QVBoxLayout()
+        for w in (self.preview, self.cam_box, self.btn_start, self.btn_video, self.btn_stop):
+            layout.addWidget(w)
+        container = QWidget(); container.setLayout(layout); self.setCentralWidget(container)
 
-        self.greeting_checkbox = QPushButton("Enable greeting on startup", self)
-        self.greeting_checkbox.setCheckable(True)
-        self.greeting_checkbox.setChecked(settings.get("speak_greeting", True))
-        self.greeting_checkbox.clicked.connect(self.update_greeting_setting)
-        layout.addWidget(self.greeting_checkbox)
-
-        self.setLayout(layout)
-
-    def update_greeting_setting(self):
-        settings["speak_greeting"] = self.greeting_checkbox.isChecked()
-        save_settings(settings)
-
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-
-        self.setWindowTitle("Object Detection Assistant")
-        self.setGeometry(100, 100, 500, 700)
-
-        self.video_label = QLabel(self)
-        self.video_label.setFixedSize(640, 480)
-
-        self.start_button = QPushButton("Start Detection", self)
-        self.start_button.clicked.connect(self.start_detection)
-
-        self.stop_button = QPushButton("Stop Detection", self)
-        self.stop_button.clicked.connect(self.stop_detection)
-        self.stop_button.setEnabled(False)
-
-        self.settings_button = QPushButton("Settings", self)
-        self.settings_button.setGeometry(700, 10, 80, 30)
-        self.settings_button.setEnabled(True)
-        self.settings_button.clicked.connect(self.open_settings)
-
-        self.text_box = QTextEdit(self)  # Add a text box to display class and confidence
-        self.text_box.setReadOnly(True)
-        self.text_box.setFixedHeight(100)
-
-        layout = QVBoxLayout()
-        layout.addWidget(self.video_label)
-        layout.addWidget(self.start_button)
-        layout.addWidget(self.stop_button)
-        layout.addWidget(self.settings_button)
-        layout.addWidget(self.text_box)  # Add the text box to the layout
-
-        container = QWidget()
-        container.setLayout(layout)
-        self.setCentralWidget(container)
-
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_frame)
-
+        # Runtime vars
         self.cap = None
-        self.frame_counter = 0
-        self.detection_active = False
+        self.timer = QTimer(self); self.timer.timeout.connect(self.next_frame)
+        self.is_file = False
 
-        self.current_function_index = 0
-        self.functions = ["Start Detection", "Stop Detection", "Settings"]
-        self.setMouseTracking(True)
+    # ---------- SOURCES ---------- #
 
-        settings = load_settings()
-        speak_greeting = settings.get("speak_greeting", True)
+    def start_camera(self):
+        cam_id = int(self.cam_box.currentText())
+        self._start(cv2.VideoCapture(cam_id), is_file=False)
 
-        if speak_greeting:
-            engine.say("Hello, I am your assistant. Tap once to hear the next function, swipe right to select it. To start object detection, press the 'Start Detection' button. To stop it, press the 'Stop Detection' button.")
-            engine.runAndWait()
+    def open_video(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select video", "", "Video (*.mp4 *.avi *.mov *.mkv)")
+        if path:
+            self._start(cv2.VideoCapture(path), is_file=True)
 
-    def start_detection(self):
-        if not self.detection_active:
-            self.cap = cv2.VideoCapture(0)
-            self.timer.start(30)
-            self.start_button.setEnabled(False)
-            self.stop_button.setEnabled(True)
-            self.detection_active = True
-            engine.say("Detection started")
-            engine.runAndWait()
-
-    def stop_detection(self):
-        if self.detection_active:
-            self.timer.stop()
-            if self.cap:
-                self.cap.release()
-            self.video_label.clear()
-            self.start_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
-            self.detection_active = False
-            engine.say("Detection stopped")
-            engine.runAndWait()
-
-    def open_settings(self):
-        self.close()
-        subprocess.run(["python", "setting_wind.py"])
-
-    def update_frame(self):
-        if not self.cap:
+    def _start(self, capture: cv2.VideoCapture, *, is_file: bool):
+        self.stop_stream()
+        if not capture.isOpened():
+            print("Unable to open source")
             return
+        self.cap, self.is_file = capture, is_file
+        # Reduce buffering latency on webcams
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.btn_start.setEnabled(False); self.btn_video.setEnabled(False); self.btn_stop.setEnabled(True)
+        self.timer.start(30)
+        print("Stream started")
 
-        ret, frame = self.cap.read()
-        if not ret:
-            return
+    def stop_stream(self):
+        if self.cap:
+            self.timer.stop(); self.cap.release(); self.cap = None
+            self.preview.clear()
+            self.btn_start.setEnabled(True); self.btn_video.setEnabled(True); self.btn_stop.setEnabled(False)
+            print("Stream stopped")
 
-        self.frame_counter += 1
+    # ---------- FRAME LOOP ---------- #
 
-        if self.frame_counter % FRAME_SKIP == 0:
-            results = model(frame)  # YOLO detection
-            detected_objects = results.pandas().xyxy[0]
+    def next_frame(self):
+        if not (self.cap and self.cap.isOpened()):
+            self.stop_stream(); return
+        ok, frame = self.cap.read()
+        if not ok:
+            if self.is_file:
+                print("Video finished")
+            self.stop_stream(); return
 
-            # Convert confidence to numeric and drop NaNs
-            detected_objects['confidence'] = pd.to_numeric(detected_objects['confidence'], errors='coerce')
-            detected_objects = detected_objects.dropna(subset=['confidence'])
+        # Inference (BGR→RGB) at 640‑px longer side
+        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = _MODEL(img, size=640)  # returns list length=1
+        annotated = results.render()[0]  # already BGR
 
-            # Filter objects based on user-defined criteria
-            labels = filter_objects(detected_objects)
-
-            # Check if "person" is detected
-            if "person" in labels:
-                for index, row in detected_objects.iterrows():
-                    if row['name'] == "person":
-                        # Crop face from the frame
-                        x1, y1, x2, y2 = int(row['xmin']), int(row['ymin']), int(row['xmax']), int(row['ymax'])
-                        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(frame.shape[1], x2), min(frame.shape[0], y2)  # Boundary checks
-                        face = frame[y1:y2, x1:x2]
-
-                        # Validate and process the face
-                        if face is not None and face.size > 0 and len(face.shape) == 3 and face.shape[2] == 3:
-                            try:
-                                # Resize and preprocess the face
-                                face_resized = cv2.resize(face, (32, 32))  # Resize to model's input size
-                                face_resized = face_resized / 255.0  # Normalize
-                                face_resized = face_resized.reshape(1, 32, 32, 3)  # Add batch dimension
-
-                                # Predict and get label and confidence
-                                predictions = face_recognition_model.predict(face_resized)
-                                predicted_class = predictions.argmax(axis=-1)[0]
-                                confidence = predictions.max()
-                                face_label = CLASS_NAMES[predicted_class] if confidence > 0.5 else "Unknown"
-
-                                # Append results to the text box
-                                self.text_box.append(f"Recognized: {face_label}, Confidence: {confidence:.2f}")
-
-                                # Draw rectangle and label around the face
-                                face_color = get_color("face")
-                                cv2.rectangle(frame, (x1, y1), (x2, y2), face_color, 2)
-                                cv2.putText(frame, face_label, (x1 - 50, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, face_color, 2)
-                            except Exception as e:
-                                print(f"Error processing face: {e}")
-
-            # Convert frame for display
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = frame.shape
-            bytes_per_line = ch * w
-            qimg = QImage(frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
-            self.video_label.setPixmap(QPixmap.fromImage(qimg))
+        # Qt preview
+        h, w, ch = annotated.shape
+        qt_img = QImage(annotated.data, w, h, ch * w, QImage.Format_BGR888)
+        self.preview.setPixmap(QPixmap.fromImage(qt_img))
 
 
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.current_function_index = (self.current_function_index + 1) % len(self.functions)
-            engine.say(f"Next function: {self.functions[self.current_function_index]}")
-            engine.runAndWait()
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.RightButton:
-            selected_function = self.functions[self.current_function_index]
-            engine.say(f"You selected: {selected_function}")
-            engine.runAndWait()
-            if selected_function == "Start Detection":
-                self.start_detection()
-            elif selected_function == "Stop Detection":
-                self.stop_detection()
-            elif selected_function == "Settings":  
-                self.open_settings()
-
-
+# --------------------  MAIN  -------------------------- #
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()  
-    sys.exit(app.exec_())  
+    gui = DetectorGUI(); gui.show()
+    sys.exit(app.exec_())

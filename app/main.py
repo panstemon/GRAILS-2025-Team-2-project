@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 YOLOv5 + Face-Recognition Demo GUI (PyQt5)
-• Shows each detected object in a green box.
-• For class 0 (person) the label is replaced with the recognised face name,
-  otherwise it stays “person”. Unknown faces keep the “person” label.
+• Object boxes: each class drawn in its own colour.
+• “person” boxes are relabelled with the recognised face name (if any).
 """
 
 import sys, pickle
@@ -65,6 +64,15 @@ ALLOWED_NAMES = {
     "airplane", "traffic light", "stop sign",
 }
 ALLOWED_IDX = {i for i, n in _MODEL.names.items() if n in ALLOWED_NAMES}
+
+# --------- colour palette: one deterministic colour per class ----------
+_COLOURS = {}
+def colour_for(cls_id: int) -> tuple:
+    """Return a BGR colour tuple, deterministic per class id."""
+    if cls_id not in _COLOURS:
+        rng = np.random.RandomState(cls_id * 12345)   # stable seed
+        _COLOURS[cls_id] = tuple(int(x) for x in rng.randint(40, 256, 3))
+    return _COLOURS[cls_id]
 
 # --------------------  GUI  ---------------------------
 class DetectorGUI(QMainWindow):
@@ -165,12 +173,9 @@ class DetectorGUI(QMainWindow):
 
         annotated = frame.copy()
 
-        # build list of detections
+        # list of detections
         boxes = pred.cpu().numpy() if pred is not None else np.empty((0,6))
-        labels = []
-        for *xyxy, conf, cls in boxes:
-            cls = int(cls)
-            labels.append(_MODEL.names[cls])
+        labels = [_MODEL.names[int(cls)] for *_, cls in boxes]
 
         # ------ FACE RECOG to rename person boxes ------
         if boxes.size and _FACE_OK and KNOWN_ENCODINGS:
@@ -181,29 +186,30 @@ class DetectorGUI(QMainWindow):
             for (top, right, bottom, left), enc in zip(locs, encs):
                 matches = face_recognition.compare_faces(KNOWN_ENCODINGS, enc, tolerance=0.5)
                 if True not in matches: continue
-                # majority vote
                 counts = {}
                 for i,m in enumerate(matches):
                     if m: counts[KNOWN_NAMES[i]] = counts.get(KNOWN_NAMES[i],0)+1
                 name = max(counts, key=counts.get)
 
-                # upscale to full frame
+                # upscale face centre to full frame
                 s = 1/shrink
                 cx = int(((left+right)*0.5)*s); cy = int(((top+bottom)*0.5)*s)
-                # find person box that encloses this face centre
+                # find enclosing person box
                 for i, (*xyxy, conf, cls) in enumerate(boxes):
                     if int(cls)!=0: continue
                     x1,y1,x2,y2 = map(int,xyxy)
                     if x1<=cx<=x2 and y1<=cy<=y2:
-                        labels[i] = name               # replace label
+                        labels[i] = name  # replace label
                         break
 
         # ------ draw everything ------
-        for (x1,y1,x2,y2,conf,cls), lbl in zip(boxes, labels):
-            x1,y1,x2,y2 = map(int,(x1,y1,x2,y2))
-            cv2.rectangle(annotated,(x1,y1),(x2,y2),(0,255,0),2)
-            cv2.rectangle(annotated,(x1,y1-20),(x1+len(lbl)*11,y1),(0,255,0),-1)
-            cv2.putText(annotated,lbl,(x1+2,y1-5),cv2.FONT_HERSHEY_SIMPLEX,0.55,(0,0,0),1)
+        for (*xyxy, conf, cls), lbl in zip(boxes, labels):
+            x1,y1,x2,y2 = map(int,xyxy)
+            colour = colour_for(int(cls))
+            cv2.rectangle(annotated,(x1,y1),(x2,y2), colour, 2)
+            (tw,th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            cv2.rectangle(annotated,(x1,y1-th-6),(x1+tw+6,y1), colour, -1)
+            cv2.putText(annotated, lbl, (x1+3,y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,0), 1)
 
         # Qt preview
         h,w,ch = annotated.shape

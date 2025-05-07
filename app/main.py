@@ -1,53 +1,70 @@
 # -*- coding: utf-8 -*-
 """
-YOLOv5 + Face-Recognition Demo GUI (PyQt5)
-• Object boxes: each class drawn in its own colour.
-• “person” boxes are relabelled with the recognised face name (if any).
+Optimised YOLOv5 + Face‑Recognition GUI (PyQt5)
+───────────────────────────────────────────────
+◆ Windows‑friendly, no funky compiler steps.
+◆ YOLO runs FP16 on CUDA, FP32 on CPU.
+◆ Face recognition scoped to each detected person ROI – now using a fully
+  contiguous RGB array and letting *face_recognition* detect landmarks itself
+  (fixes the `compute_face_descriptor()` TypeError on some dlib wheels).
+◆ Single Qt timer – zero threads, zero frame queue latency.
+
+Install:
+    pip install pyqt5 opencv-python torch torchvision torchaudio
+    pip install face_recognition   # optional, enables face ID
+
+Run:
+    python yolo_face_gui_optimized.py
 """
 
-import sys, pickle
+import os, sys, pickle, time
 from pathlib import Path
 from typing import List, Tuple
 
 import cv2
 import numpy as np
 import torch
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QLabel, QPushButton, QFileDialog,
-    QComboBox, QVBoxLayout, QWidget, QInputDialog, QMessageBox,
+    QApplication, QFileDialog, QLabel, QMainWindow, QMessageBox, QPushButton,
+    QComboBox, QVBoxLayout, QWidget, QInputDialog,
 )
-from PyQt5.QtGui import QPixmap, QImage
-from PyQt5.QtCore import QTimer
 
-# --------------------  FACE LIB (optional)  --------------------
+# ─────────────────────────  Torch & OpenCV tweaks  ────────────────────────────
+os.environ["KMP_DUPLICATE_LIB_OK"] = "True"  # weird Windows + PyTorch edge‑case
+cv2.ocl.setUseOpenCL(False)                   # avoid OpenCL path on AMD/Intel iGPUs
 try:
-    import face_recognition                                  # type: ignore
+    import torch._dynamo as _dynamo; _dynamo.disable()  # skip Dynamo/Inductor
+except Exception:
+    pass
+
+torch.set_grad_enabled(False)
+_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ─────────────────────────  Face DB helpers  ──────────────────────────────────
+try:
+    import face_recognition  # type: ignore
     _FACE_OK = True
 except ImportError:
-    print("face_recognition not installed – face ID disabled")
-    _FACE_OK = False
+    print("face_recognition not installed – face ID disabled"); _FACE_OK = False
 
 _FACE_DB = Path("known_faces.pkl")
-
 
 def _load_faces() -> Tuple[List[str], List[np.ndarray]]:
     if _FACE_DB.exists():
         with _FACE_DB.open("rb") as f:
-            d = pickle.load(f)
-            return d.get("names", []), d.get("encodings", [])
+            data = pickle.load(f); return data["names"], data["encodings"]
     return [], []
 
-
-def _save_faces(nm: List[str], enc: List[np.ndarray]):
+def _save_faces(names: List[str], encs: List[np.ndarray]):
     with _FACE_DB.open("wb") as f:
-        pickle.dump({"names": nm, "encodings": enc}, f)
+        pickle.dump({"names": names, "encodings": encs}, f)
 
+KNOWN_NAMES, KNOWN_ENCS = _load_faces() if _FACE_OK else ([], [])
 
-KNOWN_NAMES, KNOWN_ENCODINGS = _load_faces() if _FACE_OK else ([], [])
-
-# --------------------  MODEL INIT  --------------------
-print("Loading YOLOv5 model…")
-_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# ─────────────────────────  YOLO initialisation  ─────────────────────────────
+print("Loading YOLOv5 model …")
 _MODEL = (
     torch.hub.load("ultralytics/yolov5", "yolov5s", pretrained=True)
     .to(_DEVICE)
@@ -55,169 +72,150 @@ _MODEL = (
 )
 if _DEVICE == "cuda":
     _MODEL.half()
-print(f"Model loaded on {_DEVICE}")
+print(f"Model ready on {_DEVICE}")
 
-ALLOWED_NAMES = {
-    "person",
-    "knife", "scissors", "baseball bat", "fork", "baseball glove", "tennis racket",
+ALLOWED_CLASSES = {
+    "person", "knife", "scissors", "baseball bat", "fork", "baseball glove", "tennis racket",
     "car", "motorcycle", "truck", "bus", "train", "bicycle",
     "airplane", "traffic light", "stop sign",
 }
-ALLOWED_IDX = {i for i, n in _MODEL.names.items() if n in ALLOWED_NAMES}
+ALLOWED_IDX = {i for i, n in _MODEL.names.items() if n in ALLOWED_CLASSES}
 
-# --------- colour palette: one deterministic colour per class ----------
+# Deterministic colour per class id (BGR)
 _COLOURS = {}
-def colour_for(cls_id: int) -> tuple:
-    """Return a BGR colour tuple, deterministic per class id."""
+
+def _colour(cls_id: int):
     if cls_id not in _COLOURS:
-        rng = np.random.RandomState(cls_id * 12345)   # stable seed
-        _COLOURS[cls_id] = tuple(int(x) for x in rng.randint(40, 256, 3))
+        rng = np.random.RandomState(cls_id * 13 + 17)
+        _COLOURS[cls_id] = tuple(int(x) for x in rng.randint(50, 256, 3))
     return _COLOURS[cls_id]
 
-# --------------------  GUI  ---------------------------
+# ─────────────────────────  GUI  ──────────────────────────────────────────────
 class DetectorGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("YOLOv5 Object & Face Detection")
-        self.setGeometry(100, 100, 800, 700)
+        self.setGeometry(100, 100, 820, 720)
 
-        self.preview = QLabel(alignment=0x84)        # center
-        self.preview.setFixedSize(640, 480)
+        self.label_preview = QLabel(alignment=Qt.AlignCenter); self.label_preview.setFixedSize(640, 480)
+        self.combo_cam = QComboBox(); self.combo_cam.addItems([str(i) for i in range(5)])
+        self.btn_start = QPushButton("Start Camera"); self.btn_video = QPushButton("Open Video …")
+        self.btn_stop  = QPushButton("Stop");         self.btn_faces = QPushButton("Add Person …")
+        self.btn_faces.setEnabled(_FACE_OK); self.btn_stop.setEnabled(False)
 
-        self.cam_box = QComboBox(); self.cam_box.addItems([str(i) for i in range(5)])
+        self.btn_start.clicked.connect(self._start_camera)
+        self.btn_video.clicked.connect(self._open_video)
+        self.btn_stop.clicked.connect(self._stop)
+        self.btn_faces.clicked.connect(self._add_person)
 
-        self.btn_start  = QPushButton("Start Camera")
-        self.btn_video  = QPushButton("Open Video…")
-        self.btn_stop   = QPushButton("Stop")
-        self.btn_addfac = QPushButton("Add Person…"); self.btn_addfac.setEnabled(_FACE_OK)
-        self.btn_stop.setEnabled(False)
-
-        self.btn_start.clicked.connect(self.start_camera)
-        self.btn_video.clicked.connect(self.open_video)
-        self.btn_stop.clicked.connect(self.stop_stream)
-        self.btn_addfac.clicked.connect(self.add_person)
-
-        lay = QVBoxLayout()
-        for w in (
-            self.preview, self.cam_box,
-            self.btn_start, self.btn_video, self.btn_stop, self.btn_addfac
-        ):
+        lay = QVBoxLayout();
+        for w in (self.label_preview, self.combo_cam, self.btn_start, self.btn_video, self.btn_stop, self.btn_faces):
             lay.addWidget(w)
-        c = QWidget(); c.setLayout(lay); self.setCentralWidget(c)
+        container = QWidget(); container.setLayout(lay); self.setCentralWidget(container)
 
-        self.cap = None
-        self.timer = QTimer(self); self.timer.timeout.connect(self.next_frame)
-        self.is_file = False
+        self.cap = None; self._file_mode = False
+        self.timer = QTimer(self); self.timer.setInterval(30); self.timer.timeout.connect(self._next)
 
-    # ---------- source handling ----------
-    def start_camera(self):
-        self._start(cv2.VideoCapture(int(self.cam_box.currentText())), is_file=False)
+    # ───────────────────  Source management  ───────────────────
+    def _start_camera(self):
+        self._start(cv2.VideoCapture(int(self.combo_cam.currentText())), is_file=False)
 
-    def open_video(self):
-        p, _ = QFileDialog.getOpenFileName(self, "Select video", "", "Video (*.mp4 *.avi *.mov *.mkv)")
-        if p: self._start(cv2.VideoCapture(p), is_file=True)
+    def _open_video(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select video", "", "Video (*.mp4 *.avi *.mov *.mkv)")
+        if path: self._start(cv2.VideoCapture(path), is_file=True)
 
     def _start(self, cap: cv2.VideoCapture, *, is_file: bool):
-        self.stop_stream()
+        self._stop()
         if not cap.isOpened():
             QMessageBox.warning(self, "Error", "Unable to open source"); return
-        self.cap, self.is_file = cap, is_file
+        self.cap, self._file_mode = cap, is_file
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self.btn_start.setEnabled(False); self.btn_video.setEnabled(False); self.btn_stop.setEnabled(True)
-        self.timer.start(30); print("Stream started")
+        for b in (self.btn_start, self.btn_video): b.setEnabled(False)
+        self.btn_stop.setEnabled(True); self.timer.start(); print("Stream started")
 
-    def stop_stream(self):
+    def _stop(self):
         if self.cap:
-            self.timer.stop(); self.cap.release(); self.cap = None
-            self.preview.clear()
-            self.btn_start.setEnabled(True); self.btn_video.setEnabled(True); self.btn_stop.setEnabled(False)
+            self.timer.stop(); self.cap.release(); self.cap = None; self.label_preview.clear()
+            for b in (self.btn_start, self.btn_video): b.setEnabled(True)
+            self.btn_stop.setEnabled(False)
+            if _DEVICE == "cuda": torch.cuda.empty_cache()
             print("Stream stopped")
 
-    # ---------- face DB ----------
-    def add_person(self):
+    # ───────────────────  Face DB actions  ────────────────────
+    def _add_person(self):
         if not _FACE_OK: return
-        imgs, _ = QFileDialog.getOpenFileNames(self, "Select face images", "", "Images (*.jpg *.png *.jpeg)")
-        if not imgs: return
-        name, ok = QInputDialog.getText(self, "Person Name", "Enter name:"); name = name.strip()
+        files, _ = QFileDialog.getOpenFileNames(self, "Select face images", "", "Images (*.jpg *.png *.jpeg)")
+        if not files: return
+        name, ok = QInputDialog.getText(self, "Person Name", "Enter name:")
+        name = name.strip();
         if not ok or not name: return
-        new_encs = []
-        for p in imgs:
-            img = face_recognition.load_image_file(p)
+        new_encs: List[np.ndarray] = []
+        for f in files:
+            img = face_recognition.load_image_file(f)
             locs = face_recognition.face_locations(img, model="hog")
-            if not locs: continue
-            new_encs.append(face_recognition.face_encodings(img, locs)[0])
+            if locs:
+                new_encs.append(face_recognition.face_encodings(img, locs)[0])
         if not new_encs:
             QMessageBox.information(self, "Face Add", "No faces found."); return
-        global KNOWN_NAMES, KNOWN_ENCODINGS
-        KNOWN_NAMES.extend([name]*len(new_encs)); KNOWN_ENCODINGS.extend(new_encs)
-        _save_faces(KNOWN_NAMES, KNOWN_ENCODINGS)
+        KNOWN_NAMES.extend([name] * len(new_encs)); KNOWN_ENCS.extend(new_encs)
+        _save_faces(KNOWN_NAMES, KNOWN_ENCS)
         QMessageBox.information(self, "Face Add", f"Added {len(new_encs)} image(s) for {name}.")
 
-    # ---------- main loop ----------
-    def next_frame(self):
+    # ───────────────────  Main loop  ──────────────────────────
+    def _next(self):
         if not (self.cap and self.cap.isOpened()):
-            self.stop_stream(); return
+            self._stop(); return
         ok, frame = self.cap.read()
         if not ok:
-            if self.is_file: print("Video finished")
-            self.stop_stream(); return
+            if self._file_mode: print("Video finished")
+            self._stop(); return
 
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        res = _MODEL(img_rgb, size=640)
-        pred = res.pred[0]
+        pred = _MODEL(img_rgb, size=640).pred[0]
 
-        # filter unwanted classes
         if pred is not None and pred.shape[0]:
-            keep = torch.tensor([int(c) in ALLOWED_IDX for c in pred[:,5]], dtype=torch.bool, device=pred.device)
+            keep = torch.tensor([int(c) in ALLOWED_IDX for c in pred[:, 5]], device=pred.device, dtype=torch.bool)
             pred = pred[keep]
+        else:
+            pred = torch.empty((0, 6))
 
-        annotated = frame.copy()
+        boxes = pred.cpu().numpy(); labels = [_MODEL.names[int(cls)] for *_, cls in boxes]
 
-        # list of detections
-        boxes = pred.cpu().numpy() if pred is not None else np.empty((0,6))
-        labels = [_MODEL.names[int(cls)] for *_, cls in boxes]
+        if _FACE_OK and KNOWN_ENCS and len(boxes):
+            for idx, (*xyxy, conf, cls) in enumerate(boxes):
+                if int(cls) != 0:  # 0 == person
+                    continue
+                x1, y1, x2, y2 = map(int, xyxy)
+                pad = int(0.1 * (y2 - y1));
+                roi = img_rgb[max(0, y1 - pad): y2 + pad, max(0, x1 - pad): x2 + pad]
+                if roi.size < 1024:  # too tiny
+                    continue
+                roi = np.ascontiguousarray(roi)  # important for dlib bindings
+                encs = face_recognition.face_encodings(roi)  # self‑landmarking fixes TypeError
+                best_name, best_votes = None, 0
+                for enc in encs:
+                    matches = face_recognition.compare_faces(KNOWN_ENCS, enc, tolerance=0.48)
+                    if True in matches:
+                        votes = {}
+                        for i, m in enumerate(matches):
+                            if m: nm = KNOWN_NAMES[i]; votes[nm] = votes.get(nm, 0) + 1
+                        nm, v = max(votes.items(), key=lambda kv: kv[1])
+                        if v > best_votes:
+                            best_name, best_votes = nm, v
+                if best_name:
+                    labels[idx] = best_name
 
-        # ------ FACE RECOG to rename person boxes ------
-        if boxes.size and _FACE_OK and KNOWN_ENCODINGS:
-            shrink = 0.25 if min(img_rgb.shape[:2]) > 720 else 0.8
-            small  = cv2.resize(img_rgb, (0,0), fx=shrink, fy=shrink)
-            locs   = face_recognition.face_locations(small, number_of_times_to_upsample=2, model="hog")
-            encs   = face_recognition.face_encodings(small, locs)
-            for (top, right, bottom, left), enc in zip(locs, encs):
-                matches = face_recognition.compare_faces(KNOWN_ENCODINGS, enc, tolerance=0.5)
-                if True not in matches: continue
-                counts = {}
-                for i,m in enumerate(matches):
-                    if m: counts[KNOWN_NAMES[i]] = counts.get(KNOWN_NAMES[i],0)+1
-                name = max(counts, key=counts.get)
-
-                # upscale face centre to full frame
-                s = 1/shrink
-                cx = int(((left+right)*0.5)*s); cy = int(((top+bottom)*0.5)*s)
-                # find enclosing person box
-                for i, (*xyxy, conf, cls) in enumerate(boxes):
-                    if int(cls)!=0: continue
-                    x1,y1,x2,y2 = map(int,xyxy)
-                    if x1<=cx<=x2 and y1<=cy<=y2:
-                        labels[i] = name  # replace label
-                        break
-
-        # ------ draw everything ------
         for (*xyxy, conf, cls), lbl in zip(boxes, labels):
-            x1,y1,x2,y2 = map(int,xyxy)
-            colour = colour_for(int(cls))
-            cv2.rectangle(annotated,(x1,y1),(x2,y2), colour, 2)
-            (tw,th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-            cv2.rectangle(annotated,(x1,y1-th-6),(x1+tw+6,y1), colour, -1)
-            cv2.putText(annotated, lbl, (x1+3,y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,0), 1)
+            x1, y1, x2, y2 = map(int, xyxy); colour = _colour(int(cls))
+            cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
+            (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+            cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 6, y1), colour, -1)
+            cv2.putText(frame, lbl, (x1 + 3, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
 
-        # Qt preview
-        h,w,ch = annotated.shape
-        img = QImage(annotated.data,w,h,ch*w,QImage.Format_BGR888)
-        self.preview.setPixmap(QPixmap.fromImage(img))
+        h, w, ch = frame.shape
+        qimg = QImage(frame.data, w, h, ch * w, QImage.Format_BGR888)
+        self.label_preview.setPixmap(QPixmap.fromImage(qimg))
 
-# --------------------  MAIN  --------------------------
+# ─────────────────────────  Main entry  ───────────────────────────────────────
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    gui = DetectorGUI(); gui.show()
-    sys.exit(app.exec_())
+    app = QApplication(sys.argv); gui = DetectorGUI(); gui.show(); sys.exit(app.exec())

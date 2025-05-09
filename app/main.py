@@ -31,6 +31,9 @@ from PyQt5.QtWidgets import (
     QComboBox, QVBoxLayout, QWidget, QInputDialog,
 )
 
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 # ─────────────────────────  Torch & OpenCV tweaks  ────────────────────────────
 os.environ["KMP_DUPLICATE_LIB_OK"] = "True"  # weird Windows + PyTorch edge‑case
 cv2.ocl.setUseOpenCL(False)                   # avoid OpenCL path on AMD/Intel iGPUs
@@ -89,6 +92,57 @@ def _colour(cls_id: int):
         rng = np.random.RandomState(cls_id * 13 + 17)
         _COLOURS[cls_id] = tuple(int(x) for x in rng.randint(50, 256, 3))
     return _COLOURS[cls_id]
+
+
+
+# ─────────────────────────  Face-ID helper  ────────────────────────────
+class _FaceID:
+    """Lightweight cache + vectorised matcher (keeps main loop thread-free)."""
+    EVERY_N = 4                 # run full encoding once every N GUI frames
+    DOWNSCALE = 0.75            # shrink ROI edge; 1.0 = no downscale
+    TOLERANCE = 0.48
+
+    def __init__(self):
+        self._frame_id = 0
+        self._cache: dict[Tuple[int, int, int, int], str] = {}
+        # pre-stack for fast broadcasting
+        self._encs = np.vstack(KNOWN_ENCS) if KNOWN_ENCS else np.empty((0, 128))
+
+    def name_for(self, rgb_roi: np.ndarray, bbox: Tuple[int, int, int, int]) -> str | None:
+        """Return cached or freshly computed name for the given bbox."""
+        self._frame_id += 1
+
+        # look-up cache (simple IoU test)
+        bx1, by1, bx2, by2 = bbox
+        for (cx1, cy1, cx2, cy2), cname in list(self._cache.items()):
+            # Intersection-over-Union; >0.4 ⇒ “same face”
+            inter = max(0, min(bx2, cx2) - max(bx1, cx1)) * max(0, min(by2, cy2) - max(by1, cy1))
+            area1 = (bx2 - bx1) * (by2 - by1)
+            area2 = (cx2 - cx1) * (cy2 - cy1)
+            if inter / (area1 + area2 - inter + 1e-6) > 0.4:
+                return cname                          # reuse previous result
+
+        # not cached OR scheduled refresh
+        if self._frame_id % self.EVERY_N:
+            return None
+
+        if self.DOWNSCALE != 1.0:
+            rgb_roi = cv2.resize(rgb_roi, dsize=None, fx=self.DOWNSCALE, fy=self.DOWNSCALE)
+
+        encs = face_recognition.face_encodings(rgb_roi, num_jitters=1)
+        if not (encs and self._encs.size):
+            return None
+
+        dists = face_recognition.face_distance(self._encs, encs[0])
+        best_idx = np.argmin(dists)
+        if dists[best_idx] < self.TOLERANCE:
+            name = KNOWN_NAMES[best_idx]
+            self._cache[bbox] = name                 # memoise
+            return name
+        return None
+
+
+_FACE_ID = _FaceID()
 
 # ─────────────────────────  GUI  ──────────────────────────────────────────────
 class DetectorGUI(QMainWindow):
@@ -181,29 +235,18 @@ class DetectorGUI(QMainWindow):
 
         boxes = pred.cpu().numpy(); labels = [_MODEL.names[int(cls)] for *_, cls in boxes]
 
-        if _FACE_OK and KNOWN_ENCS and len(boxes):
+        if _FACE_OK and len(boxes):
             for idx, (*xyxy, conf, cls) in enumerate(boxes):
-                if int(cls) != 0:  # 0 == person
+                if int(cls) != 0:        # only ‘person’ boxes get a face-check
                     continue
                 x1, y1, x2, y2 = map(int, xyxy)
-                pad = int(0.1 * (y2 - y1));
+                pad = int(0.1 * (y2 - y1))
                 roi = img_rgb[max(0, y1 - pad): y2 + pad, max(0, x1 - pad): x2 + pad]
-                if roi.size < 1024:  # too tiny
+                if roi.size < 1024:
                     continue
-                roi = np.ascontiguousarray(roi)  # important for dlib bindings
-                encs = face_recognition.face_encodings(roi)  # self‑landmarking fixes TypeError
-                best_name, best_votes = None, 0
-                for enc in encs:
-                    matches = face_recognition.compare_faces(KNOWN_ENCS, enc, tolerance=0.48)
-                    if True in matches:
-                        votes = {}
-                        for i, m in enumerate(matches):
-                            if m: nm = KNOWN_NAMES[i]; votes[nm] = votes.get(nm, 0) + 1
-                        nm, v = max(votes.items(), key=lambda kv: kv[1])
-                        if v > best_votes:
-                            best_name, best_votes = nm, v
-                if best_name:
-                    labels[idx] = best_name
+                name = _FACE_ID.name_for(roi, (x1, y1, x2, y2))
+                if name:
+                    labels[idx] = name
 
         for (*xyxy, conf, cls), lbl in zip(boxes, labels):
             x1, y1, x2, y2 = map(int, xyxy); colour = _colour(int(cls))

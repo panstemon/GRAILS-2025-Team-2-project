@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Optimised YOLOv5 + Face‑Recognition GUI (PyQt5)
+Optimised YOLOv5 + Face-Recognition GUI (PyQt5)
 ───────────────────────────────────────────────
-◆ Windows‑friendly, no funky compiler steps.
+◆ Windows-friendly, no funky compiler steps.
 ◆ YOLO runs FP16 on CUDA, FP32 on CPU.
 ◆ Face recognition scoped to each detected person ROI – now using a fully
   contiguous RGB array and letting *face_recognition* detect landmarks itself
@@ -28,14 +28,14 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QFileDialog, QLabel, QMainWindow, QMessageBox, QPushButton,
-    QComboBox, QVBoxLayout, QWidget, QInputDialog,
+    QComboBox, QVBoxLayout, QWidget, QInputDialog, QTextEdit,        # ← added QTextEdit
 )
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # ─────────────────────────  Torch & OpenCV tweaks  ────────────────────────────
-os.environ["KMP_DUPLICATE_LIB_OK"] = "True"  # weird Windows + PyTorch edge‑case
+os.environ["KMP_DUPLICATE_LIB_OK"] = "True"  # weird Windows + PyTorch edge-case
 cv2.ocl.setUseOpenCL(False)                   # avoid OpenCL path on AMD/Intel iGPUs
 try:
     import torch._dynamo as _dynamo; _dynamo.disable()  # skip Dynamo/Inductor
@@ -93,8 +93,6 @@ def _colour(cls_id: int):
         _COLOURS[cls_id] = tuple(int(x) for x in rng.randint(50, 256, 3))
     return _COLOURS[cls_id]
 
-
-
 # ─────────────────────────  Face-ID helper  ────────────────────────────
 class _FaceID:
     """Lightweight cache + vectorised matcher (keeps main loop thread-free)."""
@@ -141,7 +139,6 @@ class _FaceID:
             return name
         return None
 
-
 _FACE_ID = _FaceID()
 
 # ─────────────────────────  GUI  ──────────────────────────────────────────────
@@ -149,9 +146,16 @@ class DetectorGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("YOLOv5 Object & Face Detection")
-        self.setGeometry(100, 100, 820, 720)
+        self.setGeometry(100, 100, 820, 820)
 
-        self.label_preview = QLabel(alignment=Qt.AlignCenter); self.label_preview.setFixedSize(640, 480)
+        self.label_preview = QLabel(alignment=Qt.AlignCenter)
+        self.label_preview.setFixedSize(640, 480)
+
+        # ---------- NEW: live log box ----------
+        self.log_box = QTextEdit(readOnly=True)
+        self.log_box.setFixedHeight(140)
+        self.log_box.setStyleSheet("font-family: Consolas;")
+
         self.combo_cam = QComboBox(); self.combo_cam.addItems([str(i) for i in range(5)])
         self.btn_start = QPushButton("Start Camera"); self.btn_video = QPushButton("Open Video …")
         self.btn_stop  = QPushButton("Stop");         self.btn_faces = QPushButton("Add Person …")
@@ -162,13 +166,23 @@ class DetectorGUI(QMainWindow):
         self.btn_stop.clicked.connect(self._stop)
         self.btn_faces.clicked.connect(self._add_person)
 
-        lay = QVBoxLayout();
-        for w in (self.label_preview, self.combo_cam, self.btn_start, self.btn_video, self.btn_stop, self.btn_faces):
+        lay = QVBoxLayout()
+        for w in (
+            self.label_preview, self.log_box,          # ← include log box
+            self.combo_cam, self.btn_start, self.btn_video,
+            self.btn_stop, self.btn_faces
+        ):
             lay.addWidget(w)
         container = QWidget(); container.setLayout(lay); self.setCentralWidget(container)
 
         self.cap = None; self._file_mode = False
         self.timer = QTimer(self); self.timer.setInterval(30); self.timer.timeout.connect(self._next)
+
+    # --------------- helper to write to log ---------------
+    def _log(self, msg: str):
+        self.log_box.append(msg)
+        self.log_box.verticalScrollBar().setValue(
+            self.log_box.verticalScrollBar().maximum())
 
     # ───────────────────  Source management  ───────────────────
     def _start_camera(self):
@@ -184,6 +198,7 @@ class DetectorGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "Unable to open source"); return
         self.cap, self._file_mode = cap, is_file
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.log_box.clear()                                        # reset log
         for b in (self.btn_start, self.btn_video): b.setEnabled(False)
         self.btn_stop.setEnabled(True); self.timer.start(); print("Stream started")
 
@@ -201,7 +216,7 @@ class DetectorGUI(QMainWindow):
         files, _ = QFileDialog.getOpenFileNames(self, "Select face images", "", "Images (*.jpg *.png *.jpeg)")
         if not files: return
         name, ok = QInputDialog.getText(self, "Person Name", "Enter name:")
-        name = name.strip();
+        name = name.strip()
         if not ok or not name: return
         new_encs: List[np.ndarray] = []
         for f in files:
@@ -228,12 +243,14 @@ class DetectorGUI(QMainWindow):
         pred = _MODEL(img_rgb, size=640).pred[0]
 
         if pred is not None and pred.shape[0]:
-            keep = torch.tensor([int(c) in ALLOWED_IDX for c in pred[:, 5]], device=pred.device, dtype=torch.bool)
+            keep = torch.tensor([int(c) in ALLOWED_IDX for c in pred[:, 5]],
+                                device=pred.device, dtype=torch.bool)
             pred = pred[keep]
         else:
             pred = torch.empty((0, 6))
 
-        boxes = pred.cpu().numpy(); labels = [_MODEL.names[int(cls)] for *_, cls in boxes]
+        boxes = pred.cpu().numpy()
+        labels = [_MODEL.names[int(cls)] for *_, cls in boxes]
 
         if _FACE_OK and len(boxes):
             for idx, (*xyxy, conf, cls) in enumerate(boxes):
@@ -248,12 +265,17 @@ class DetectorGUI(QMainWindow):
                 if name:
                     labels[idx] = name
 
-        for (*xyxy, conf, cls), lbl in zip(boxes, labels):
-            x1, y1, x2, y2 = map(int, xyxy); colour = _colour(int(cls))
-            cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
-            (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-            cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 6, y1), colour, -1)
-            cv2.putText(frame, lbl, (x1 + 3, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+        # draw + log
+        if len(boxes):
+            for (*xyxy, conf, cls), lbl in zip(boxes, labels):
+                x1, y1, x2, y2 = map(int, xyxy); colour = _colour(int(cls))
+                cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
+                (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+                cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 6, y1), colour, -1)
+                cv2.putText(frame, lbl, (x1 + 3, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+                self._log(f"{lbl} – {conf:.2f}")
+        else:
+            self._log("–")
 
         h, w, ch = frame.shape
         qimg = QImage(frame.data, w, h, ch * w, QImage.Format_BGR888)
